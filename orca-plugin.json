@@ -1,0 +1,35 @@
+{
+  "manifestVersion": 2,
+  "id": "bash-mode",
+  "name": "Bash Mode",
+  "version": "0.1.0",
+  "description": "A bash mode for the structured chat box: turn it on, type a command, and it is sent as `!command` (run by the claude-bang-shell plugin).",
+  "license": "MIT",
+  "repository": "https://github.com/WDAFNMS/orca-bash-mode",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "commands": [
+      {
+        "id": "bash-mode.inject",
+        "title": "Bash Mode: inject into the chat page"
+      },
+      {
+        "id": "bash-mode.remove",
+        "title": "Bash Mode: remove from the chat page"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "status",
+        "text": "bash …",
+        "tooltip": "Bash Mode",
+        "command": "bash-mode.inject"
+      }
+    ]
+  }
+}
