@@ -6,9 +6,11 @@
 //   3. it asks the main process to re-inject after every page load, then closes the inspector again.
 // The inspector is open for about a second. Nothing on disk is modified and no start-up flag is needed.
 import type { OrcaWorkerApi } from 'orca/worker'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import * as claude from './claude.ts'
+import { isOrcaMainCommand } from './guard.ts'
 
 const PORT = 9229
 const STATUS_ID = 'status'
@@ -20,16 +22,10 @@ type State = 'working' | 'ok' | 'failed' | 'removed'
 
 const pageScript = () => readFileSync(fileURLToPath(new URL('./page-script.js', import.meta.url)), 'utf8')
 
-// The worker is forked by the main process, so its parent must be that app's own main executable (on macOS the
-// helper binary running this worker lives in the same .app bundle; the Node-mode children of the main process
-// run with `-e` and are not it). If not (another packaging, a wrapper), do not signal anything.
+// The worker is forked by the main process, so its parent must be that app's own main executable (see guard.ts).
 function parentIsOrcaMain(): string | null {
   const cmd = execFileSync('ps', ['-o', 'command=', '-p', String(process.ppid)]).toString().trim()
-  const bundle = process.execPath.split('.app/')[0]
-  const isMain = process.platform === 'darwin' && process.execPath.includes('.app/')
-    ? cmd.startsWith(`${bundle}.app/Contents/MacOS/`) && !cmd.includes(' -e ')
-    : cmd === process.execPath
-  return isMain ? null : `parent process is not the Orca main process (parent=${cmd.slice(0, 80)})`
+  return isOrcaMainCommand(cmd, process.execPath, process.platform) ? null : `parent process is not the Orca main process (parent=${cmd.slice(0, 80)})`
 }
 
 async function targets(): Promise<Target[] | null> {
@@ -91,17 +87,47 @@ const removeExpression = `(() => {
     .map(wc => wc.executeJavaScript('window.__bashMode && window.__bashMode.destroy && window.__bashMode.destroy(); "removed"').catch(e => 'error: ' + e)));
 })()`
 
+let stop: (() => void) | undefined
+
+/** Called by Orca before it stops the worker (disable, uninstall, update). */
+export function deactivate(): void { stop?.() }
+
 export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   // A stray rejection must never take the worker down: log it and carry on.
   process.on('unhandledRejection', e => orca.log(`unhandled rejection: ${e instanceof Error ? e.message : String(e)}`))
   process.on('uncaughtException', e => orca.log(`uncaught exception: ${e.message}`))
+
   let busy = false
   let attempt = 0
   let timer: ReturnType<typeof setTimeout> | undefined
+  let inj: { state: State; detail: string } = { state: 'working', detail: '' }
 
-  const show = (state: State, tooltip: string) => {
-    const text = { working: 'bash …', ok: 'bash ✓', failed: 'bash ✗', removed: 'bash –' }[state]
-    void orca.host.call('statusBar.update', { id: STATUS_ID, text, tooltip }).catch(() => undefined)
+  /** The status bar item: how injecting went, and whether the Claude plugin that runs `!command` is there. */
+  const render = () => {
+    const bang = claude.isEnabled()
+    let text: string
+    let tip: string
+    if (inj.state === 'working') { text = 'bash …'; tip = 'Injecting bash mode into the chat page…' }
+    else if (inj.state === 'failed') { text = 'bash ✗'; tip = `Bash mode is not active: ${inj.detail}. Click to try again.` }
+    else if (inj.state === 'removed') { text = 'bash –'; tip = 'Bash mode is removed from the chat page. Click to inject it again.' }
+    else if (bang === false) {
+      text = 'bash ⚠'
+      tip = 'Bash mode is active, but the Claude plugin that runs `!command` is not installed, so commands will not run. Run "Bash Mode: install the Claude plugin" from the command palette.'
+    } else { text = 'bash ✓'; tip = 'Bash mode is active. Toggle it in the chat box with Ctrl+Shift+B. Click to inject again.' }
+    void orca.host.call('statusBar.update', { id: STATUS_ID, text, tooltip: tip }).catch(() => undefined)
+  }
+  const setInj = (state: State, detail = '') => { inj = { state, detail }; render() }
+  const tick = setInterval(render, 60_000)   // the Claude plugin can be installed or removed from outside
+  tick.unref()
+  stop = () => { clearInterval(tick); clearTimeout(timer) }
+
+  // Commands that change things outside Orca ask twice: the first call only says what it would do.
+  const asked = new Map<string, number>()
+  const confirmed = (key: string): boolean => {
+    const t = asked.get(key)
+    if (t !== undefined && Date.now() - t < 60_000) { asked.delete(key); return true }
+    asked.set(key, Date.now())
+    return false
   }
 
   /** One pass through the five steps above. Returns an error message, or null on success. */
@@ -130,26 +156,82 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     }
   }
 
-  async function inject(): Promise<void> {
-    if (busy) return
+  async function inject(): Promise<string | null> {
+    if (busy) return 'already busy'
     busy = true
     clearTimeout(timer)
-    show('working', 'Injecting bash mode into the chat page…')
+    setInj('working')
     let err: string | null
     try { err = await run(injectExpression, 'ok') } catch (e) { err = e instanceof Error ? e.message : String(e) }
     busy = false
-    if (!err) { attempt = 0; show('ok', 'Bash mode is active. Click to inject again. Toggle it in the chat box with Ctrl+Shift+B.'); return }
+    if (!err) { attempt = 0; setInj('ok'); return null }
     orca.log(`inject failed: ${err}`)
     const delay = RETRY_MS[attempt++]
-    show('failed', `Bash mode is not active: ${err}${delay ? ' (retrying)' : ''}. Click to try again.`)
-    if (delay) timer = setTimeout(() => void inject(), delay)
+    setInj('failed', `${err}${delay ? ' (retrying)' : ''}`)
+    if (delay) { timer = setTimeout(() => void inject(), delay); timer.unref() }
+    return err
   }
 
-  orca.commands.register('bash-mode.inject', async () => { attempt = 0; await inject(); return 'done' })
-  orca.commands.register('bash-mode.remove', async () => {
+  async function removeFromPage(): Promise<string | null> {
     clearTimeout(timer); busy = true
-    try { const err = await run(() => removeExpression, 'removed'); show('removed', 'Bash mode is removed from the chat page until you inject it again.'); return err ?? 'removed' }
-    finally { busy = false }
+    try { const err = await run(() => removeExpression, 'removed'); if (!err) setInj('removed'); return err } finally { busy = false }
+  }
+
+  const claudeLine = () => {
+    const on = claude.isEnabled()
+    return on === true ? 'Claude plugin bang-shell: installed.' : on === false ? 'Claude plugin bang-shell: NOT installed, so `!command` will not run.' : 'Claude plugin bang-shell: could not read ~/.claude/settings.json.'
+  }
+
+  orca.commands.register('bash-mode.inject', async () => {
+    attempt = 0
+    const err = await inject()
+    return `${err ? `Bash mode is not active: ${err}.` : 'Bash mode is active.'}\n${claudeLine()}`
+  })
+
+  orca.commands.register('bash-mode.remove', async () => {
+    const err = await removeFromPage()
+    return err ? `Could not remove it: ${err}` : 'Removed from the chat page. Use "inject into the chat page" to bring it back.'
+  })
+
+  orca.commands.register('bash-mode.install-claude-plugin', async () => {
+    if (claude.isEnabled() === true) return 'The Claude plugin bang-shell is already installed.'
+    if (!confirmed('install')) {
+      return 'This runs `claude plugin marketplace add WDAFNMS/claude-bang-shell` and `claude plugin install bang-shell@claude-bang-shell`. '
+        + 'It changes your Claude Code settings (~/.claude/settings.json), and the plugin runs `!command` lines without a permission prompt. '
+        + 'Run this command again within 60 seconds to confirm. Chats that are already open need to be restarted to load it.'
+    }
+    try {
+      const msg = await claude.install()
+      await orca.storage.set('installedClaudePlugin', true)
+      render()
+      return `Installed. ${msg}\nChats that are already open need to be restarted to load it.`
+    } catch (e) {
+      return `Install failed: ${e instanceof Error ? e.message : String(e)}`
+    }
+  })
+
+  orca.commands.register('bash-mode.uninstall', async () => {
+    const ours = (await orca.storage.get('installedClaudePlugin')) === true
+    if (!confirmed('uninstall')) {
+      return `This removes bash mode from the chat page${ours ? ', uninstalls the Claude plugin bang-shell that this plugin installed (and its marketplace)' : ' (it leaves the Claude plugin bang-shell alone: this plugin did not install it)'}, and then uninstalls this plugin. Run this command again within 60 seconds to confirm.`
+    }
+    const report: string[] = []
+    const pageErr = await removeFromPage()
+    report.push(pageErr ? `Chat page: not cleaned (${pageErr}); restart Orca to drop it.` : 'Chat page: bash mode removed.')
+    if (ours) {
+      try { await claude.uninstall(); await orca.storage.delete('installedClaudePlugin'); report.push('Claude plugin bang-shell: uninstalled.') }
+      catch (e) { report.push(`Claude plugin bang-shell: NOT uninstalled (${e instanceof Error ? e.message : String(e)}).`) }
+    }
+    // Uninstalling stops this very worker, so hand the last step to a detached process.
+    try {
+      const orcaBin = process.platform === 'darwin' && process.execPath.includes('.app/') ? `${process.execPath.split('.app/')[0]}.app/Contents/Resources/bin/orca` : 'orca'
+      const keys = execFileSync(orcaBin, ['plugin', 'list']).toString().split('\n').map(l => l.match(/^(\S+\.bash-mode)\s/)?.[1]).filter((k): k is string => !!k)
+      if (keys.length === 1) {
+        spawn('sh', ['-c', 'sleep 2; exec "$0" plugin uninstall "$1"', orcaBin, keys[0]], { detached: true, stdio: 'ignore' }).unref()
+        report.push(`This plugin (${keys[0]}): uninstalling in a moment.`)
+      } else report.push(`This plugin: run \`orca plugin uninstall <key>\` yourself (found ${keys.length} candidates: ${keys.join(', ') || 'none'}).`)
+    } catch (e) { report.push(`This plugin: run \`orca plugin uninstall <key>\` yourself (${e instanceof Error ? e.message : String(e)}).`) }
+    return report.join('\n')
   })
 
   void inject()

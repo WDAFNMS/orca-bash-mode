@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "bash-mode",
   "name": "Bash Mode",
-  "version": "0.1.0",
-  "description": "A bash mode for the structured chat box: turn it on, type a command, and it is sent as `!command` (run by the claude-bang-shell plugin).",
+  "version": "0.2.0",
+  "description": "A bash mode for the structured chat box: turn it on, type a command, and it is sent as `!command`. Checks for, installs and uninstalls the claude-bang-shell plugin that runs it.",
   "license": "MIT",
   "repository": "https://github.com/WDAFNMS/orca-bash-mode",
   "engines": {
@@ -21,6 +21,14 @@
       {
         "id": "bash-mode.remove",
         "title": "Bash Mode: remove from the chat page"
+      },
+      {
+        "id": "bash-mode.install-claude-plugin",
+        "title": "Bash Mode: install the Claude plugin (bang-shell)"
+      },
+      {
+        "id": "bash-mode.uninstall",
+        "title": "Bash Mode: uninstall everything"
       }
     ],
     "statusBarItems": [
@@ -31,5 +39,10 @@
         "command": "bash-mode.inject"
       }
     ]
-  }
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    }
+  ]
 }
